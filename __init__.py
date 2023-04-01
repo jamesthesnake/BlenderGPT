@@ -4,6 +4,14 @@ import bpy
 import bpy.props
 import re
 
+# Add the 'libs' folder to the Python path
+libs_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
+if libs_path not in sys.path:
+    sys.path.append(libs_path)
+
+import openai
+
+from .utilities import *
 bl_info = {
     "name": "GPT-4 Blender Assistant",
     "blender": (2, 82, 0),
@@ -44,98 +52,17 @@ for c in range(0,count):
 ```"""
 
 
-# Add the 'libs' folder to the Python path
-libs_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib")
-if libs_path not in sys.path:
-    sys.path.append(libs_path)
 
+class GPT4_OT_DeleteMessage(bpy.types.Operator):
+    bl_idname = "gpt4.delete_message"
+    bl_label = "Delete Message"
+    bl_options = {'REGISTER', 'UNDO'}
 
+    message_index: bpy.props.IntProperty()
 
-import openai
-
-def get_api_key(context):
-    preferences = context.preferences
-    addon_prefs = preferences.addons[__name__].preferences
-    return addon_prefs.api_key
-
-
-def init_props():
-    bpy.types.Scene.gpt4_chat_history = bpy.props.CollectionProperty(type=bpy.types.PropertyGroup)
-    bpy.types.Scene.gpt4_chat_input = bpy.props.StringProperty(
-        name="Message",
-        description="Enter your message",
-        default="",
-    )
-    bpy.types.Scene.gpt4_button_pressed = bpy.props.BoolProperty(default=False)
-    bpy.types.PropertyGroup.type = bpy.props.StringProperty()
-    bpy.types.PropertyGroup.content = bpy.props.StringProperty()
-
-def clear_props():
-    del bpy.types.Scene.gpt4_chat_history
-    del bpy.types.Scene.gpt4_chat_input
-    del bpy.types.Scene.gpt4_button_pressed
-
-def generate_blender_code(prompt, chat_history):
-    messages = [{"role": "system", "content": system_prompt}]
-    for message in chat_history[-10:]:
-        if message.type == "assistant":
-            messages.append({"role": "assistant", "content": "```\n" + message.content + "\n```"})
-        else:
-            messages.append({"role": message.type.lower(), "content": message.content})
-
-    # Add the current user message
-    messages.append({"role": "user", "content": "Can you please write Blender code for me that accomplishes the following task: " + prompt + "? \n. Do not respond with anything that is not Python code. Do not provide explanations"})
-
-
-    try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=messages,
-            stream=True,
-            max_tokens=1500,
-        )
-    except Exception as e: # Use GPT-3.5 if GPT-4 is not available
-        response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            stream=True,
-            max_tokens=1500,
-        )
-
-    try:
-        collected_events = []
-        completion_text = ''
-        # iterate through the stream of events
-        for event in response:
-            if 'role' in event['choices'][0]['delta']:
-                # skip
-                continue
-            if len(event['choices'][0]['delta']) == 0:
-                # skip
-                continue
-            collected_events.append(event)  # save the event response
-            event_text = event['choices'][0]['delta']['content']
-            completion_text += event_text  # append the text
-            print(completion_text, flush=True, end='\r')
-        completion_text = re.findall(r'```(.*?)```', completion_text, re.DOTALL)[0]
-        completion_text = re.sub(r'^python', '', completion_text, flags=re.MULTILINE)
-        
-        return completion_text
-    except IndexError:
-        return None
-
-def split_area_to_text_editor(context):
-    area = context.area
-    for region in area.regions:
-        if region.type == 'WINDOW':
-            override = {'area': area, 'region': region}
-            bpy.ops.screen.area_split(override, direction='VERTICAL', factor=0.5)
-            break
-
-    new_area = context.screen.areas[-1]
-    new_area.type = 'TEXT_EDITOR'
-    return new_area
-
+    def execute(self, context):
+        context.scene.gpt4_chat_history.remove(self.message_index)
+        return {'FINISHED'}
 
 class GPT4_OT_ShowCode(bpy.types.Operator):
     bl_idname = "gpt4.show_code"
@@ -183,16 +110,24 @@ class GPT4_PT_Panel(bpy.types.Panel):
 
         column.label(text="Chat history:")
         box = column.box()
-        for message in context.scene.gpt4_chat_history:
+        for index, message in enumerate(context.scene.gpt4_chat_history):
             if message.type == 'assistant':
                 row = box.row()
                 row.label(text="Assistant: ")
                 show_code_op = row.operator("gpt4.show_code", text="Show Code")
                 show_code_op.code = message.content
+                delete_message_op = row.operator("gpt4.delete_message", text="", icon="TRASH", emboss=False)
+                delete_message_op.message_index = index
             else:
-                box.label(text=f"User: {message.content}")
+                row = box.row()
+                row.label(text=f"User: {message.content}")
+                delete_message_op = row.operator("gpt4.delete_message", text="", icon="TRASH", emboss=False)
+                delete_message_op.message_index = index
 
         column.separator()
+        
+        column.label(text="GPT Model:")
+        column.prop(context.scene, "gpt4_model", text="")
 
         column.label(text="Enter your message:")
         column.prop(context.scene, "gpt4_chat_input", text="")
@@ -224,7 +159,10 @@ class GPT4_OT_Execute(bpy.types.Operator):
     )
 
     def execute(self, context):
-        openai.api_key = get_api_key(context)
+        openai.api_key = get_api_key(context, __name__)
+        # if null then set to env key
+        if not openai.api_key:
+            openai.api_key = os.getenv("OPENAI_API_KEY")
 
         if not openai.api_key:
             self.report({'ERROR'}, "No API key detected. Please set the API key in the addon preferences.")
@@ -233,7 +171,7 @@ class GPT4_OT_Execute(bpy.types.Operator):
         context.scene.gpt4_button_pressed = True
         bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
         
-        blender_code = generate_blender_code(context.scene.gpt4_chat_input, context.scene.gpt4_chat_history)
+        blender_code = generate_blender_code(context.scene.gpt4_chat_input, context.scene.gpt4_chat_history, context, system_prompt)
 
         message = context.scene.gpt4_chat_history.add()
         message.type = 'user'
@@ -286,6 +224,8 @@ def register():
     bpy.utils.register_class(GPT4_PT_Panel)
     bpy.utils.register_class(GPT4_OT_ClearChat)
     bpy.utils.register_class(GPT4_OT_ShowCode)
+    bpy.utils.register_class(GPT4_OT_DeleteMessage)
+
 
     bpy.types.VIEW3D_MT_mesh_add.append(menu_func)
     init_props()
@@ -297,6 +237,7 @@ def unregister():
     bpy.utils.unregister_class(GPT4_PT_Panel)
     bpy.utils.unregister_class(GPT4_OT_ClearChat)
     bpy.utils.register_class(GPT4_OT_ShowCode)
+    bpy.utils.register_class(GPT4_OT_DeleteMessage)
 
     bpy.types.VIEW3D_MT_mesh_add.remove(menu_func)
     clear_props()
